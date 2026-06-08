@@ -159,6 +159,7 @@ impl App {
 
         self.create_layout(&root)?;
         self.write_project_files(&root, &project_name)?;
+        self.setup_loader_dependencies(&root)?;
 
         if self.create_git_repo {
             self.try_git_init(&root);
@@ -261,6 +262,45 @@ impl App {
             .status();
     }
 
+    fn setup_loader_dependencies(&self, root: &Path) -> Result<(), String> {
+        match self.gl_loader {
+            GlLoader::Glad | GlLoader::Glad2 => self.clone_glad_repo(root),
+            GlLoader::Glew => Ok(()),
+        }
+    }
+
+    fn clone_glad_repo(&self, root: &Path) -> Result<(), String> {
+        let glad_dir = root.join("third_party/glad");
+        if glad_dir.exists() {
+            return Ok(());
+        }
+
+        let mut args = vec![
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/Dav1dde/glad.git",
+            "third_party/glad",
+        ];
+
+        if self.gl_loader == GlLoader::Glad2 {
+            args.insert(1, "--branch");
+            args.insert(2, "glad2");
+        }
+
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .map_err(|e| format!("Could not clone glad repository: {e}"))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("git clone for glad failed".to_owned())
+        }
+    }
+
     fn main_cpp_template(&self, project_name: &str) -> String {
         let loader_include = match self.gl_loader {
             GlLoader::Glad => "#include <glad/glad.h>",
@@ -330,6 +370,8 @@ impl App {
 
     fn cmake_template(&self, project_name: &str) -> String {
         let cxx_std = parse_cpp_standard(&self.cpp_standard);
+        let gl_profile = if self.core_profile { "core" } else { "compatibility" };
+        let gl_api = format!("gl:{gl_profile}={}.{}", self.opengl_major, self.opengl_minor);
 
         let backend_block = match self.window_backend {
             WindowBackend::Glfw => "find_package(glfw3 CONFIG REQUIRED)\n",
@@ -341,26 +383,24 @@ impl App {
             WindowBackend::Sdl3 => "SDL3::SDL3",
         };
 
-        let (loader_find, loader_link) = match self.gl_loader {
-            GlLoader::Glad => (
-                "# Install glad with your package manager or provide a target named glad\nfind_package(glad CONFIG REQUIRED)\n",
-                "glad",
+        let (loader_block, loader_link) = match self.gl_loader {
+            GlLoader::Glad | GlLoader::Glad2 => (
+                format!(
+                    "set(GLAD_SOURCES_DIR \"${{CMAKE_CURRENT_SOURCE_DIR}}/third_party/glad\")\nadd_subdirectory(${{GLAD_SOURCES_DIR}}/cmake glad_cmake)\nglad_add_library(glad_loader REPRODUCIBLE LOADER API {gl_api})\n"
+                ),
+                "glad_loader",
             ),
-            GlLoader::Glad2 => (
-                "# Install glad2 with your package manager or provide a target named glad\nfind_package(glad CONFIG REQUIRED)\n",
-                "glad",
-            ),
-            GlLoader::Glew => ("find_package(GLEW REQUIRED)\n", "GLEW::GLEW"),
+            GlLoader::Glew => ("find_package(GLEW REQUIRED)\n".to_owned(), "GLEW::GLEW"),
         };
 
         let optional_packages = self.optional_package_notes();
 
         format!(
-            "cmake_minimum_required(VERSION 3.24)\nproject({project_name} LANGUAGES CXX)\n\nset(CMAKE_CXX_STANDARD {cxx_std})\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\nset(CMAKE_CXX_EXTENSIONS OFF)\n\nfind_package(OpenGL REQUIRED)\n{backend_block}{loader_find}\n{optional_packages}\nadd_executable(${{PROJECT_NAME}} src/main.cpp)\n\ntarget_link_libraries(${{PROJECT_NAME}}\n    PRIVATE\n        OpenGL::GL\n        {backend_link}\n        {loader_link}\n)\n\nif(MSVC)\n    target_compile_options(${{PROJECT_NAME}} PRIVATE /W4 /permissive-)\nelse()\n    target_compile_options(${{PROJECT_NAME}} PRIVATE -Wall -Wextra -Wpedantic)\nendif()\n",
+            "cmake_minimum_required(VERSION 3.24)\nproject({project_name} LANGUAGES C CXX)\n\nset(CMAKE_CXX_STANDARD {cxx_std})\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\nset(CMAKE_CXX_EXTENSIONS OFF)\n\nfind_package(OpenGL REQUIRED)\n{backend_block}{loader_find}\n{optional_packages}\nadd_executable(${{PROJECT_NAME}} src/main.cpp)\n\ntarget_link_libraries(${{PROJECT_NAME}}\n    PRIVATE\n        OpenGL::GL\n        {backend_link}\n        {loader_link}\n)\n\nif(MSVC)\n    target_compile_options(${{PROJECT_NAME}} PRIVATE /W4 /permissive-)\nelse()\n    target_compile_options(${{PROJECT_NAME}} PRIVATE -Wall -Wextra -Wpedantic)\nendif()\n",
             project_name = project_name,
             cxx_std = cxx_std,
             backend_block = backend_block,
-            loader_find = loader_find,
+            loader_find = loader_block,
             optional_packages = optional_packages,
             backend_link = backend_link,
             loader_link = loader_link,
