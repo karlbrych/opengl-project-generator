@@ -13,7 +13,10 @@ When you click **Generate project template**, it creates a new project folder (d
 ## Prerequisites
 
 - Rust toolchain (stable) with Cargo installed
-
+- Git
+- Cmake
+- OpenGL development libraries  
+- GLFW, GLEW packages 
 ## Run the project
 
 From the repository root:
