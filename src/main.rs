@@ -70,7 +70,6 @@ struct App {
     // Project metadata
     project_name: String,
     output_directory: String,
-    organization: String,
     cpp_standard: String,
 
     // OpenGL setup
@@ -109,7 +108,6 @@ impl Default for App {
         Self {
             project_name: "my_opengl_app".to_owned(),
             output_directory: "./generated".to_owned(),
-            organization: "my_company".to_owned(),
             cpp_standard: "c++20".to_owned(),
             opengl_major: 4,
             opengl_minor: 6,
@@ -260,6 +258,11 @@ impl App {
             .arg("init")
             .current_dir(root)
             .status();
+    }
+
+    fn constrain_opengl_version(&mut self) {
+        let max_minor = if self.opengl_major == 3 { 3 } else { 6 };
+        self.opengl_minor = self.opengl_minor.min(max_minor);
     }
 
     fn setup_loader_dependencies(&self, root: &Path) -> Result<(), String> {
@@ -534,11 +537,6 @@ impl eframe::App for App {
             ui.label("C++ standard:");
             ui.text_edit_singleline(&mut self.cpp_standard);
         });
-        ui.horizontal(|ui| {
-            ui.label("Organization/namespace:");
-            ui.text_edit_singleline(&mut self.organization);
-        });
-
         egui::ComboBox::from_label("Window backend")
             .selected_text(self.window_backend.as_str())
             .show_ui(ui, |ui| {
@@ -565,9 +563,14 @@ impl eframe::App for App {
 
         ui.horizontal(|ui| {
             ui.label("OpenGL version:");
+            let prev_major = self.opengl_major;
             ui.add(egui::DragValue::new(&mut self.opengl_major).range(3..=4));
+            if self.opengl_major != prev_major {
+                self.constrain_opengl_version();
+            }
             ui.label(".");
-            ui.add(egui::DragValue::new(&mut self.opengl_minor).range(0..=6));
+            let max_minor = if self.opengl_major == 3 { 3 } else { 6 };
+            ui.add(egui::DragValue::new(&mut self.opengl_minor).range(0..=max_minor));
         });
 
         ui.separator();
