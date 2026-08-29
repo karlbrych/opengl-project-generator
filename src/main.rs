@@ -65,7 +65,7 @@ impl BuildSystem {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct App {
     // Project metadata
     project_name: String,
@@ -278,30 +278,37 @@ impl App {
             return Ok(());
         }
 
-        let mut args = vec![
-            "clone",
-            "--depth",
-            "1",
-            "https://github.com/Dav1dde/glad.git",
-            "third_party/glad",
-        ];
-
-        if self.gl_loader == GlLoader::Glad2 {
-            args.insert(1, "--branch");
-            args.insert(2, "glad2");
-        }
+        // The repository's default branch is glad2, so glad 0.1 has to be asked
+        // for by name -- otherwise the sources and the generated CMake disagree
+        // about which header (glad/glad.h vs glad/gl.h) exists.
+        let branch = match self.gl_loader {
+            GlLoader::Glad2 => "glad2",
+            _ => "master",
+        };
 
         let status = Command::new("git")
-            .args(&args)
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                branch,
+                "https://github.com/Dav1dde/glad.git",
+                "third_party/glad",
+            ])
             .current_dir(root)
             .status()
             .map_err(|e| format!("Could not clone glad repository: {e}"))?;
 
-        if status.success() {
-            Ok(())
-        } else {
-            Err("git clone for glad failed".to_owned())
+        if !status.success() {
+            return Err("git clone for glad failed".to_owned());
         }
+
+        // Vendor it: without dropping the nested .git, the surrounding project
+        // sees third_party/glad as an unusable embedded repository.
+        let _ = fs::remove_dir_all(glad_dir.join(".git"));
+
+        Ok(())
     }
 
     fn main_cpp_template(&self, project_name: &str) -> String {
@@ -319,16 +326,17 @@ impl App {
 
         match self.window_backend {
             WindowBackend::Glfw => format!(
-                "#include <iostream>\n\n{loader_include}\n#include <GLFW/glfw3.h>\n\nint main() {{\n    if (!glfwInit()) {{\n        std::cerr << \"Failed to initialize GLFW\\n\";\n        return -1;\n    }}\n\n    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, {major});\n    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, {minor});\n    glfwWindowHint(GLFW_OPENGL_PROFILE, {profile_hint});\n    glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, {debug_hint});\n\n    GLFWwindow* window = glfwCreateWindow(1280, 720, \"{project_name}\", nullptr, nullptr);\n    if (!window) {{\n        std::cerr << \"Failed to create GLFW window\\n\";\n        glfwTerminate();\n        return -1;\n    }}\n\n    glfwMakeContextCurrent(window);\n\n{loader_init}\n\n    while (!glfwWindowShouldClose(window)) {{\n        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);\n        glClear(GL_COLOR_BUFFER_BIT);\n\n        glfwSwapBuffers(window);\n        glfwPollEvents();\n    }}\n\n    glfwDestroyWindow(window);\n    glfwTerminate();\n    return 0;\n}}\n",
+                "#include <iostream>\n\n{loader_include}\n#include <GLFW/glfw3.h>\n\nint main() {{\n    if (!glfwInit()) {{\n        std::cerr << \"Failed to initialize GLFW\\n\";\n        return -1;\n    }}\n\n    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, {major});\n    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, {minor});\n    glfwWindowHint(GLFW_OPENGL_PROFILE, {profile_hint});\n    glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, {debug_hint});\n    glfwWindowHint(GLFW_SRGB_CAPABLE, {srgb_hint});\n\n    GLFWwindow* window = glfwCreateWindow(1280, 720, \"{project_name}\", nullptr, nullptr);\n    if (!window) {{\n        std::cerr << \"Failed to create GLFW window\\n\";\n        glfwTerminate();\n        return -1;\n    }}\n\n    glfwMakeContextCurrent(window);\n\n{loader_init}\n\n    while (!glfwWindowShouldClose(window)) {{\n        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);\n        glClear(GL_COLOR_BUFFER_BIT);\n\n        glfwSwapBuffers(window);\n        glfwPollEvents();\n    }}\n\n    glfwDestroyWindow(window);\n    glfwTerminate();\n    return 0;\n}}\n",
                 major = self.opengl_major,
                 minor = self.opengl_minor,
                 profile_hint = profile_hint,
                 debug_hint = if self.debug_context { "GLFW_TRUE" } else { "GLFW_FALSE" },
+                srgb_hint = if self.srgb_framebuffer { "GLFW_TRUE" } else { "GLFW_FALSE" },
                 loader_init = self.glfw_loader_init(),
                 project_name = project_name,
             ),
             WindowBackend::Sdl3 => format!(
-                "#include <iostream>\n\n{loader_include}\n#include <SDL3/SDL.h>\n\nint main() {{\n    if (SDL_Init(SDL_INIT_VIDEO) < 0) {{\n        std::cerr << \"Failed to initialize SDL3: \" << SDL_GetError() << \"\\n\";\n        return -1;\n    }}\n\n    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, {major});\n    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, {minor});\n    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, {profile_hint});\n    SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, {srgb_hint});\n\n    SDL_Window* window = SDL_CreateWindow(\"{project_name}\", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);\n    if (!window) {{\n        std::cerr << \"Failed to create SDL3 window: \" << SDL_GetError() << \"\\n\";\n        SDL_Quit();\n        return -1;\n    }}\n\n    SDL_GLContext gl_context = SDL_GL_CreateContext(window);\n    if (!gl_context) {{\n        std::cerr << \"Failed to create OpenGL context: \" << SDL_GetError() << \"\\n\";\n        SDL_DestroyWindow(window);\n        SDL_Quit();\n        return -1;\n    }}\n\n{loader_init}\n\n    bool running = true;\n    while (running) {{\n        SDL_Event event;\n        while (SDL_PollEvent(&event)) {{\n            if (event.type == SDL_EVENT_QUIT) {{\n                running = false;\n            }}\n        }}\n\n        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);\n        glClear(GL_COLOR_BUFFER_BIT);\n        SDL_GL_SwapWindow(window);\n    }}\n\n    SDL_GL_DestroyContext(gl_context);\n    SDL_DestroyWindow(window);\n    SDL_Quit();\n    return 0;\n}}\n",
+                "#include <iostream>\n\n{loader_include}\n#include <SDL3/SDL.h>\n\nint main() {{\n    if (!SDL_Init(SDL_INIT_VIDEO)) {{\n        std::cerr << \"Failed to initialize SDL3: \" << SDL_GetError() << \"\\n\";\n        return -1;\n    }}\n\n    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, {major});\n    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, {minor});\n    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, {profile_hint});\n    SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, {srgb_hint});\n\n    SDL_Window* window = SDL_CreateWindow(\"{project_name}\", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);\n    if (!window) {{\n        std::cerr << \"Failed to create SDL3 window: \" << SDL_GetError() << \"\\n\";\n        SDL_Quit();\n        return -1;\n    }}\n\n    SDL_GLContext gl_context = SDL_GL_CreateContext(window);\n    if (!gl_context) {{\n        std::cerr << \"Failed to create OpenGL context: \" << SDL_GetError() << \"\\n\";\n        SDL_DestroyWindow(window);\n        SDL_Quit();\n        return -1;\n    }}\n\n{loader_init}\n\n    bool running = true;\n    while (running) {{\n        SDL_Event event;\n        while (SDL_PollEvent(&event)) {{\n            if (event.type == SDL_EVENT_QUIT) {{\n                running = false;\n            }}\n        }}\n\n        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);\n        glClear(GL_COLOR_BUFFER_BIT);\n        SDL_GL_SwapWindow(window);\n    }}\n\n    SDL_GL_DestroyContext(gl_context);\n    SDL_DestroyWindow(window);\n    SDL_Quit();\n    return 0;\n}}\n",
                 major = self.opengl_major,
                 minor = self.opengl_minor,
                 profile_hint = if self.core_profile {
@@ -352,7 +360,7 @@ impl App {
                 "    if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) {\n        std::cerr << \"Failed to initialize glad2\\n\";\n        return -1;\n    }"
             }
             GlLoader::Glew => {
-                "    glewExperimental = GL_TRUE;\n    if (glewInit() != GLEW_OK) {\n        std::cerr << \"Failed to initialize GLEW\\n\";\n        return -1;\n    }"
+                "    glewExperimental = GL_TRUE;\n    const GLenum glew_status = glewInit();\n#ifdef GLEW_ERROR_NO_GLX_DISPLAY\n    // GLEW reports this on Wayland even though the context is perfectly usable.\n    const bool glew_ok = glew_status == GLEW_OK || glew_status == GLEW_ERROR_NO_GLX_DISPLAY;\n#else\n    const bool glew_ok = glew_status == GLEW_OK;\n#endif\n    if (!glew_ok) {\n        std::cerr << \"Failed to initialize GLEW: \" << glewGetErrorString(glew_status) << \"\\n\";\n        return -1;\n    }"
             }
         }
     }
@@ -366,47 +374,310 @@ impl App {
                 "    if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {\n        std::cerr << \"Failed to initialize glad2\\n\";\n        return -1;\n    }"
             }
             GlLoader::Glew => {
-                "    glewExperimental = GL_TRUE;\n    if (glewInit() != GLEW_OK) {\n        std::cerr << \"Failed to initialize GLEW\\n\";\n        return -1;\n    }"
+                "    glewExperimental = GL_TRUE;\n    const GLenum glew_status = glewInit();\n#ifdef GLEW_ERROR_NO_GLX_DISPLAY\n    // GLEW reports this on Wayland even though the context is perfectly usable.\n    const bool glew_ok = glew_status == GLEW_OK || glew_status == GLEW_ERROR_NO_GLX_DISPLAY;\n#else\n    const bool glew_ok = glew_status == GLEW_OK;\n#endif\n    if (!glew_ok) {\n        std::cerr << \"Failed to initialize GLEW: \" << glewGetErrorString(glew_status) << \"\\n\";\n        return -1;\n    }"
             }
         }
     }
 
     fn cmake_template(&self, project_name: &str) -> String {
-        let cxx_std = parse_cpp_standard(&self.cpp_standard);
-        let gl_profile = if self.core_profile { "core" } else { "compatibility" };
-        let gl_api = format!("gl:{gl_profile}={}.{}", self.opengl_major, self.opengl_minor);
+        const TEMPLATE: &str = r##"cmake_minimum_required(VERSION 3.21)
+project(@PROJECT_NAME@ LANGUAGES C CXX)
 
-        let backend_block = match self.window_backend {
-            WindowBackend::Glfw => "find_package(glfw3 CONFIG REQUIRED)\n",
-            WindowBackend::Sdl3 => "find_package(SDL3 CONFIG REQUIRED)\n",
-        };
+set(CMAKE_CXX_STANDARD @CXX_STANDARD@)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-        let backend_link = match self.window_backend {
-            WindowBackend::Glfw => "glfw",
-            WindowBackend::Sdl3 => "SDL3::SDL3",
-        };
+# Single-config generators (Makefiles, Ninja) start with no build type at all.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
 
-        let (loader_block, loader_link) = match self.gl_loader {
-            GlLoader::Glad | GlLoader::Glad2 => (
-                format!(
-                    "set(GLAD_SOURCES_DIR \"${{CMAKE_CURRENT_SOURCE_DIR}}/third_party/glad\")\nadd_subdirectory(${{GLAD_SOURCES_DIR}}/cmake glad_cmake)\nglad_add_library(glad_loader REPRODUCIBLE LOADER API {gl_api})\n"
-                ),
-                "glad_loader",
+# Keep the executable in one predictable place across generators, so the
+# debugger configs and the asset copy below always agree on the path.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+foreach(output_config IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${output_config} "${CMAKE_BINARY_DIR}/bin")
+endforeach()
+
+# Used as a fallback everywhere a package ships only a .pc file.
+find_package(PkgConfig QUIET)
+
+# ---------------------------------------------------------------- OpenGL
+set(OpenGL_GL_PREFERENCE GLVND)
+find_package(OpenGL REQUIRED)
+
+# ---------------------------------------------------------------- Window backend
+@BACKEND_BLOCK@
+# ---------------------------------------------------------------- OpenGL loader
+@LOADER_BLOCK@
+# ---------------------------------------------------------------- Application
+file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+)
+
+add_executable(${PROJECT_NAME} ${APP_SOURCES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+target_link_libraries(${PROJECT_NAME}
+    PRIVATE
+        OpenGL::GL
+        ${BACKEND_LIB}
+        ${LOADER_LIB}
+)
+
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+@OPTIONAL_BLOCK@
+# ---------------------------------------------------------------- Assets
+# Shaders and textures are loaded relative to the executable at runtime.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/assets"
+    COMMENT "Copying assets next to the executable"
+)
+"##;
+
+        TEMPLATE
+            .replace("@PROJECT_NAME@", project_name)
+            .replace("@CXX_STANDARD@", &parse_cpp_standard(&self.cpp_standard).to_string())
+            .replace("@BACKEND_BLOCK@", &self.cmake_backend_block())
+            .replace("@LOADER_BLOCK@", &self.cmake_loader_block())
+            .replace("@OPTIONAL_BLOCK@", &self.cmake_optional_block())
+    }
+
+    /// Resolves the window backend through its CMake config package first and
+    /// pkg-config second, so a system package manager install works as well as
+    /// vcpkg/conan. Sets `BACKEND_LIB` to whichever target was found.
+    fn cmake_backend_block(&self) -> String {
+        match self.window_backend {
+            WindowBackend::Glfw => r##"find_package(glfw3 CONFIG QUIET)
+if(TARGET glfw)
+    set(BACKEND_LIB glfw)
+elseif(PkgConfig_FOUND)
+    pkg_check_modules(GLFW3_PC QUIET IMPORTED_TARGET glfw3)
+    if(TARGET PkgConfig::GLFW3_PC)
+        set(BACKEND_LIB PkgConfig::GLFW3_PC)
+    endif()
+endif()
+
+if(NOT BACKEND_LIB)
+    message(FATAL_ERROR
+        "GLFW was not found. Install it with one of:\n"
+        "  Debian/Ubuntu : sudo apt install libglfw3-dev\n"
+        "  Fedora        : sudo dnf install glfw-devel\n"
+        "  Arch          : sudo pacman -S glfw\n"
+        "  macOS         : brew install glfw\n"
+        "  vcpkg         : vcpkg install glfw3 (configure with the vcpkg toolchain file)")
+endif()
+"##
+            .to_owned(),
+            WindowBackend::Sdl3 => r##"find_package(SDL3 CONFIG QUIET)
+if(TARGET SDL3::SDL3)
+    set(BACKEND_LIB SDL3::SDL3)
+elseif(PkgConfig_FOUND)
+    pkg_check_modules(SDL3_PC QUIET IMPORTED_TARGET sdl3)
+    if(TARGET PkgConfig::SDL3_PC)
+        set(BACKEND_LIB PkgConfig::SDL3_PC)
+    endif()
+endif()
+
+if(NOT BACKEND_LIB)
+    message(FATAL_ERROR
+        "SDL3 was not found. Install it with one of:\n"
+        "  Fedora : sudo dnf install SDL3-devel\n"
+        "  Arch   : sudo pacman -S sdl3\n"
+        "  macOS  : brew install sdl3\n"
+        "  vcpkg  : vcpkg install sdl3 (configure with the vcpkg toolchain file)\n"
+        "  source : https://github.com/libsdl-org/SDL")
+endif()
+"##
+            .to_owned(),
+        }
+    }
+
+    /// Builds the loader. glad is compiled from the checkout in `third_party/`,
+    /// which the generator clones; GLEW comes from the system. Sets `LOADER_LIB`.
+    fn cmake_loader_block(&self) -> String {
+        let api = format!(
+            "{}.{}",
+            self.opengl_major, self.opengl_minor
+        );
+        let profile = if self.core_profile { "core" } else { "compatibility" };
+
+        match self.gl_loader {
+            GlLoader::Glad => format!(
+                r##"set(GLAD_DIR "${{CMAKE_CURRENT_SOURCE_DIR}}/third_party/glad")
+if(NOT EXISTS "${{GLAD_DIR}}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "third_party/glad is missing. Fetch it with:\n"
+        "  git clone --depth 1 --branch master https://github.com/Dav1dde/glad.git third_party/glad")
+endif()
+
+# glad 0.1 generates its sources at build time with a Python script. It needs
+# only the standard library, but the interpreter has to exist -- fail here with
+# a readable message rather than midway through the build.
+find_package(Python COMPONENTS Interpreter REQUIRED)
+
+set(GLAD_API "gl={api}" CACHE STRING "" FORCE)
+set(GLAD_PROFILE "{profile}" CACHE STRING "" FORCE)
+set(GLAD_GENERATOR "c" CACHE STRING "" FORCE)
+set(GLAD_REPRODUCIBLE ON CACHE BOOL "" FORCE)
+
+# glad 0.1 declares cmake_minimum_required(VERSION 3.0), which CMake 4 rejects.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
+add_subdirectory("${{GLAD_DIR}}" glad_build)
+set(LOADER_LIB glad)
+"##,
+                api = api,
+                profile = profile,
             ),
-            GlLoader::Glew => ("find_package(GLEW REQUIRED)\n".to_owned(), "GLEW::GLEW"),
+            GlLoader::Glad2 => format!(
+                r##"set(GLAD_SOURCES_DIR "${{CMAKE_CURRENT_SOURCE_DIR}}/third_party/glad")
+if(NOT EXISTS "${{GLAD_SOURCES_DIR}}/cmake/CMakeLists.txt")
+    message(FATAL_ERROR
+        "third_party/glad is missing. Fetch it with:\n"
+        "  git clone --depth 1 --branch glad2 https://github.com/Dav1dde/glad.git third_party/glad")
+endif()
+
+find_package(Python COMPONENTS Interpreter REQUIRED)
+
+# Unlike glad 0.1, the glad2 generator depends on Jinja2. Check for it now so
+# the failure is one actionable line instead of a traceback during the build.
+execute_process(
+    COMMAND "${{Python_EXECUTABLE}}" -c "import jinja2"
+    RESULT_VARIABLE GLAD2_JINJA_RESULT
+    OUTPUT_QUIET
+    ERROR_QUIET
+)
+if(NOT GLAD2_JINJA_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "The glad2 generator needs the Jinja2 Python module:\n"
+        "  \"${{Python_EXECUTABLE}}\" -m pip install --user jinja2\n"
+        "Or regenerate this project with the 'glad' loader, which has no such dependency.")
+endif()
+
+add_subdirectory("${{GLAD_SOURCES_DIR}}/cmake" glad_build)
+glad_add_library(glad_loader REPRODUCIBLE LOADER API gl:{profile}={api})
+set(LOADER_LIB glad_loader)
+"##,
+                api = api,
+                profile = profile,
+            ),
+            GlLoader::Glew => r##"find_package(GLEW QUIET)
+if(TARGET GLEW::GLEW)
+    set(LOADER_LIB GLEW::GLEW)
+elseif(PkgConfig_FOUND)
+    pkg_check_modules(GLEW_PC QUIET IMPORTED_TARGET glew)
+    if(TARGET PkgConfig::GLEW_PC)
+        set(LOADER_LIB PkgConfig::GLEW_PC)
+    endif()
+endif()
+
+if(NOT LOADER_LIB)
+    message(FATAL_ERROR
+        "GLEW was not found. Install it with one of:\n"
+        "  Debian/Ubuntu : sudo apt install libglew-dev\n"
+        "  Fedora        : sudo dnf install glew-devel\n"
+        "  Arch          : sudo pacman -S glew\n"
+        "  macOS         : brew install glew\n"
+        "  vcpkg         : vcpkg install glew (configure with the vcpkg toolchain file)")
+endif()
+"##
+            .to_owned(),
+        }
+    }
+
+    /// Optional libraries are linked when present and skipped when not, so a
+    /// missing one never breaks the configure step. Each defines a HAVE_* macro
+    /// the application code can test.
+    fn cmake_optional_block(&self) -> String {
+        let mut uses: Vec<String> = Vec::new();
+        if self.include_glm {
+            uses.push("app_use_optional(glm HAVE_GLM glm::glm glm)".to_owned());
+        }
+        if self.include_imgui {
+            uses.push("app_use_optional(imgui HAVE_IMGUI imgui::imgui)".to_owned());
+        }
+        if self.include_assimp {
+            uses.push("app_use_optional(assimp HAVE_ASSIMP assimp::assimp)".to_owned());
+        }
+        if self.include_fmt {
+            uses.push("app_use_optional(fmt HAVE_FMT fmt::fmt)".to_owned());
+        }
+        if self.include_spdlog {
+            uses.push("app_use_optional(spdlog HAVE_SPDLOG spdlog::spdlog)".to_owned());
+        }
+
+        let stb_block = if self.include_stb_image {
+            r##"
+# stb_image is a single header, so it has no link target -- just an include dir.
+find_path(STB_IMAGE_INCLUDE_DIR NAMES stb_image.h PATH_SUFFIXES stb)
+if(STB_IMAGE_INCLUDE_DIR)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${STB_IMAGE_INCLUDE_DIR}")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_STB_IMAGE)
+    message(STATUS "Optional dependency stb_image: using ${STB_IMAGE_INCLUDE_DIR}")
+else()
+    message(STATUS "Optional dependency stb_image: not found, skipped")
+endif()
+"##
+        } else {
+            ""
         };
 
-        let optional_packages = self.optional_package_notes();
+        if uses.is_empty() && stb_block.is_empty() {
+            return String::new();
+        }
+
+        let helper = if uses.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r##"
+# Links PKG to the executable if it can be found, and defines DEFINE when it is.
+# Extra arguments are the imported target names to try, in order.
+function(app_use_optional PKG DEFINE)
+    find_package(${{PKG}} CONFIG QUIET)
+    foreach(candidate IN LISTS ARGN)
+        if(TARGET ${{candidate}})
+            target_link_libraries(${{PROJECT_NAME}} PRIVATE ${{candidate}})
+            target_compile_definitions(${{PROJECT_NAME}} PRIVATE ${{DEFINE}})
+            message(STATUS "Optional dependency ${{PKG}}: using ${{candidate}}")
+            return()
+        endif()
+    endforeach()
+
+    if(PkgConfig_FOUND)
+        string(TOLOWER "${{PKG}}" pc_module)
+        pkg_check_modules(OPT_${{PKG}} QUIET IMPORTED_TARGET ${{pc_module}})
+        if(TARGET PkgConfig::OPT_${{PKG}})
+            target_link_libraries(${{PROJECT_NAME}} PRIVATE PkgConfig::OPT_${{PKG}})
+            target_compile_definitions(${{PROJECT_NAME}} PRIVATE ${{DEFINE}})
+            message(STATUS "Optional dependency ${{PKG}}: using pkg-config module ${{pc_module}}")
+            return()
+        endif()
+    endif()
+
+    message(STATUS "Optional dependency ${{PKG}}: not found, skipped")
+endfunction()
+
+{uses}
+"##,
+                uses = uses.join("\n"),
+            )
+        };
 
         format!(
-            "cmake_minimum_required(VERSION 3.24)\nproject({project_name} LANGUAGES C CXX)\n\nset(CMAKE_CXX_STANDARD {cxx_std})\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\nset(CMAKE_CXX_EXTENSIONS OFF)\n\nfind_package(OpenGL REQUIRED)\n{backend_block}{loader_find}\n{optional_packages}\nadd_executable(${{PROJECT_NAME}} src/main.cpp)\n\ntarget_link_libraries(${{PROJECT_NAME}}\n    PRIVATE\n        OpenGL::GL\n        {backend_link}\n        {loader_link}\n)\n\nif(MSVC)\n    target_compile_options(${{PROJECT_NAME}} PRIVATE /W4 /permissive-)\nelse()\n    target_compile_options(${{PROJECT_NAME}} PRIVATE -Wall -Wextra -Wpedantic)\nendif()\n",
-            project_name = project_name,
-            cxx_std = cxx_std,
-            backend_block = backend_block,
-            loader_find = loader_block,
-            optional_packages = optional_packages,
-            backend_link = backend_link,
-            loader_link = loader_link,
+            "\n# ---------------------------------------------------------------- Optional libraries{helper}{stb_block}"
         )
     }
 
@@ -431,8 +702,50 @@ impl App {
     }
 
     fn cmake_presets_template(&self) -> String {
-        "{\n  \"version\": 6,\n  \"configurePresets\": [\n    {\n      \"name\": \"default\",\n      \"displayName\": \"Default\",\n      \"generator\": \"Ninja\",\n      \"binaryDir\": \"${sourceDir}/build\",\n      \"cacheVariables\": {\n        \"CMAKE_BUILD_TYPE\": \"Debug\"\n      }\n    }\n  ],\n  \"buildPresets\": [\n    {\n      \"name\": \"default\",\n      \"configurePreset\": \"default\"\n    }\n  ]\n}\n"
-            .to_owned()
+        // Preset version 3 is what CMake 3.21 understands, and no generator is
+        // pinned so the platform default is used (Ninja is not always present).
+        r##"{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (Debug)",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release"
+    }
+  ]
+}
+"##
+        .to_owned()
     }
 
     fn vscode_tasks_template(&self) -> String {
@@ -445,19 +758,49 @@ impl App {
     }
 
     fn vscode_launch_template(&self, project_name: &str) -> String {
-        format!(
-            "{{\n  \"version\": \"0.2.0\",\n  \"configurations\": [\n    {{\n      \"name\": \"Launch {project_name}\",\n      \"type\": \"cppvsdbg\",\n      \"request\": \"launch\",\n      \"program\": \"${{workspaceFolder}}/build/{project_name}.exe\",\n      \"args\": [],\n      \"cwd\": \"${{workspaceFolder}}\",\n      \"preLaunchTask\": \"{build_task}\"\n    }}\n  ]\n}}\n",
-            project_name = project_name,
-            build_task = match self.build_system {
-                BuildSystem::CMake => "CMake: Build",
-                BuildSystem::Meson => "Meson: Build",
-            }
-        )
+        // CMake drops the executable in build/bin (see CMakeLists.txt); Meson
+        // leaves it at the top of the build directory. cwd matches the binary so
+        // the copied assets/ folder resolves at runtime.
+        let (binary_dir, build_task) = match self.build_system {
+            BuildSystem::CMake => ("${workspaceFolder}/build/bin", "CMake: Build"),
+            BuildSystem::Meson => ("${workspaceFolder}/build", "Meson: Build"),
+        };
+
+        const TEMPLATE: &str = r##"{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch @PROJECT_NAME@",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "@BINARY_DIR@/@PROJECT_NAME@",
+      "args": [],
+      "cwd": "@BINARY_DIR@",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "@BUILD_TASK@",
+      "osx": {
+        "MIMode": "lldb"
+      },
+      "windows": {
+        "type": "cppvsdbg",
+        "program": "@BINARY_DIR@/@PROJECT_NAME@.exe"
+      }
+    }
+  ]
+}
+"##;
+
+        TEMPLATE
+            .replace("@PROJECT_NAME@", project_name)
+            .replace("@BINARY_DIR@", binary_dir)
+            .replace("@BUILD_TASK@", build_task)
     }
 
     fn readme_template(&self, project_name: &str) -> String {
         format!(
-            "# {project_name}\n\nGenerated with OpenGL Project Generator.\n\n## Selected stack\n- Windowing: {window_backend}\n- GL loader: {gl_loader}\n- Build system: {build_system}\n- OpenGL: {major}.{minor}\n\n## Optional libraries toggled\n- GLM: {glm}\n- Dear ImGui: {imgui}\n- stb_image: {stb}\n- Assimp: {assimp}\n- fmt: {fmt}\n- spdlog: {spdlog}\n\n## Build\n### CMake\n1. cmake --preset default\n2. cmake --build --preset default\n\n### Meson\n1. meson setup build\n2. meson compile -C build\n\n## Notes\n- Install dependencies with vcpkg/conan/system package manager before building.\n- See third_party/README.md for dependency guidance.\n",
+            "# {project_name}\n\nGenerated with OpenGL Project Generator.\n\n## Selected stack\n- Windowing: {window_backend}\n- GL loader: {gl_loader}\n- Build system: {build_system}\n- OpenGL: {major}.{minor}\n\n## Optional libraries toggled\n- GLM: {glm}\n- Dear ImGui: {imgui}\n- stb_image: {stb}\n- Assimp: {assimp}\n- fmt: {fmt}\n- spdlog: {spdlog}\n\n## Build\n### CMake\n1. cmake --preset default\n2. cmake --build --preset default\n\nThe executable and a copy of assets/ end up in build/bin.\nUse the `release` preset instead of `default` for an optimised build.\n\n### Meson\n1. meson setup build\n2. meson compile -C build\n\n## Requirements\n- A C++ compiler and CMake 3.21 or newer.\n- {window_backend} development files (see third_party/README.md for install commands).\n{loader_requirement}\n\nOptional libraries are linked only if they are found; each one that is defines a\nHAVE_* macro (HAVE_GLM, HAVE_FMT, ...) you can test in your code. A missing one\nnever breaks the build.\n",
             project_name = project_name,
             window_backend = self.window_backend.as_str(),
             gl_loader = self.gl_loader.as_str(),
@@ -470,7 +813,22 @@ impl App {
             assimp = yes_no(self.include_assimp),
             fmt = yes_no(self.include_fmt),
             spdlog = yes_no(self.include_spdlog),
+            loader_requirement = self.loader_requirement_note(),
         )
+    }
+
+    /// What the chosen loader needs at build time, so the generated README says
+    /// the same thing the CMake preflight checks enforce.
+    fn loader_requirement_note(&self) -> &'static str {
+        match self.gl_loader {
+            GlLoader::Glad => {
+                "- Python 3 on PATH: glad generates its sources during the build (standard library only)."
+            }
+            GlLoader::Glad2 => {
+                "- Python 3 on PATH plus the Jinja2 module (`python -m pip install --user jinja2`):\n  the glad2 generator runs during the build."
+            }
+            GlLoader::Glew => "- GLEW development files.",
+        }
     }
 
     fn third_party_readme(&self) -> String {
@@ -487,33 +845,6 @@ impl App {
         )
     }
 
-    fn optional_package_notes(&self) -> String {
-        let mut lines = Vec::new();
-        if self.include_glm {
-            lines.push("find_package(glm CONFIG QUIET)");
-        }
-        if self.include_imgui {
-            lines.push("find_package(imgui CONFIG QUIET)");
-        }
-        if self.include_stb_image {
-            lines.push("find_package(Stb CONFIG QUIET)");
-        }
-        if self.include_assimp {
-            lines.push("find_package(assimp CONFIG QUIET)");
-        }
-        if self.include_fmt {
-            lines.push("find_package(fmt CONFIG QUIET)");
-        }
-        if self.include_spdlog {
-            lines.push("find_package(spdlog CONFIG QUIET)");
-        }
-
-        if lines.is_empty() {
-            "".to_owned()
-        } else {
-            format!("{}\n", lines.join("\n"))
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -631,13 +962,115 @@ fn yes_no(flag: bool) -> &'static str {
 
 fn parse_cpp_standard(value: &str) -> u32 {
     let digits: String = value.chars().filter(char::is_ascii_digit).collect();
-    digits.parse::<u32>().unwrap_or(17)
+    let parsed = digits.parse::<u32>().unwrap_or(17);
+    // CMAKE_CXX_STANDARD only accepts these; anything else fails at configure time.
+    if [11, 14, 17, 20, 23, 26].contains(&parsed) {
+        parsed
+    } else {
+        17
+    }
 }
 
 fn gitignore_template() -> String {
-    "# Build artifacts\n/build/\n/bin/\n\n# IDE\n.vscode/*\n!.vscode/tasks.json\n!.vscode/launch.json\n\n# OS\n.DS_Store\nThumbs.db\n\n# CMake\nCMakeUserPresets.json\n".to_owned()
+    "# Build artifacts\n/build*/\n/bin/\ncompile_commands.json\n\n# IDE\n.vscode/*\n!.vscode/tasks.json\n!.vscode/launch.json\n\n# OS\n.DS_Store\nThumbs.db\n\n# CMake\nCMakeUserPresets.json\n".to_owned()
 }
 
 fn clang_format_template() -> String {
     "BasedOnStyle: LLVM\nIndentWidth: 4\nColumnLimit: 100\nBreakBeforeBraces: Allman\nAllowShortFunctionsOnASingleLine: Empty\n".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scaffolds into a scratch directory. Set OPENGL_GENERATOR_TEST_OUT to keep
+    /// the output somewhere a build can be run against it.
+    fn generate_into(app: &App, label: &str) -> PathBuf {
+        let base = std::env::var("OPENGL_GENERATOR_TEST_OUT")
+            .unwrap_or_else(|_| std::env::temp_dir().join("opengl-generator-tests").display().to_string());
+        let out = PathBuf::from(base).join(label);
+        let _ = fs::remove_dir_all(&out);
+
+        let mut app = App { output_directory: out.display().to_string(), ..app.clone() };
+        app.project_name = "my_opengl_app".to_owned();
+        app.generate_project_impl().expect("generation should succeed");
+        out.join("my_opengl_app")
+    }
+
+    fn matrix() -> Vec<(String, App)> {
+        let mut cases = Vec::new();
+        for backend in WindowBackend::ALL {
+            for loader in GlLoader::ALL {
+                let app = App {
+                    window_backend: backend,
+                    gl_loader: loader,
+                    create_git_repo: false,
+                    ..App::default()
+                };
+                let label = format!(
+                    "{}-{}",
+                    backend.as_str().to_lowercase(),
+                    loader.as_str().to_lowercase()
+                );
+                cases.push((label, app));
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn generates_every_backend_and_loader_combination() {
+        for (label, app) in matrix() {
+            let root = generate_into(&app, &label);
+            let cmake = fs::read_to_string(root.join("CMakeLists.txt")).unwrap();
+
+            assert!(cmake.contains("cmake_minimum_required(VERSION 3.21)"), "{label}");
+            assert!(cmake.contains("add_executable(${PROJECT_NAME} ${APP_SOURCES})"), "{label}");
+            assert!(cmake.contains("${BACKEND_LIB}"), "{label}");
+            assert!(cmake.contains("${LOADER_LIB}"), "{label}");
+            // Every path that sets these must also fail loudly when unset.
+            assert!(
+                cmake.contains("set(BACKEND_LIB") || cmake.contains("set(LOADER_LIB"),
+                "{label}"
+            );
+            assert!(root.join("CMakePresets.json").exists(), "{label}");
+        }
+    }
+
+    #[test]
+    fn glad_headers_match_the_cloned_branch() {
+        for (label, app) in matrix() {
+            let root = generate_into(&app, &label);
+            let main_cpp = fs::read_to_string(root.join("src/main.cpp")).unwrap();
+            if app.gl_loader != GlLoader::Glew {
+                assert!(!root.join("third_party/glad/.git").exists(), "{label}: nested repo left behind");
+            }
+            match app.gl_loader {
+                // glad 0.1 lays its header out as glad/glad.h, glad2 as glad/gl.h.
+                GlLoader::Glad => {
+                    assert!(main_cpp.contains("#include <glad/glad.h>"), "{label}");
+                    // glad 0.1 exposes its CMake support at the checkout root;
+                    // glad2 only has it under cmake/.
+                    assert!(root.join("third_party/glad/CMakeLists.txt").exists(), "{label}");
+                    assert!(!root.join("third_party/glad/cmake/GladConfig.cmake").exists(), "{label}");
+                }
+                GlLoader::Glad2 => {
+                    assert!(main_cpp.contains("#include <glad/gl.h>"), "{label}");
+                    assert!(root.join("third_party/glad/cmake/GladConfig.cmake").exists(), "{label}");
+                }
+                GlLoader::Glew => {
+                    assert!(main_cpp.contains("#include <GL/glew.h>"), "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_cpp_standards_cmake_would_not_accept() {
+        assert_eq!(parse_cpp_standard("c++20"), 20);
+        assert_eq!(parse_cpp_standard("c++23"), 23);
+        assert_eq!(parse_cpp_standard("gnu++17"), 17);
+        assert_eq!(parse_cpp_standard("c++21"), 17);
+        assert_eq!(parse_cpp_standard("nonsense"), 17);
+    }
 }
